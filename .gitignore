@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Outputs
+hardhat_reports/
+output_report/
+
+# Large / model files
+*.pt
+assets/models/
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
