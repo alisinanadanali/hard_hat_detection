@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from dataclasses import dataclass, asdict
 from typing import Callable, Dict, List, Optional
 import os
@@ -7,23 +8,27 @@ import csv
 import cv2
 
 from .detector_tracked import YoloTrackedHelmetDetector, TrackedDetection
-from .state import TrackState
 from .draw import annotate_frame, format_time
 
 
 @dataclass
 class PersonResult:
     track_id: int
-    final_label: str
+    final_label: str          # "baretli" | "baretsiz"
     hits: int
-    score_baretli: float
-    score_baretsiz: float
 
-    # baretsiz ise:
-    best_baretsiz_conf: Optional[float] = None
-    best_baretsiz_time_sec: Optional[float] = None
-    best_baretsiz_time_str: Optional[str] = None
-    best_frame_path: Optional[str] = None
+    # Her kişi için: final_label'e ait maksimum conf kare
+    best_conf: float
+    best_time_sec: float
+    best_time_str: str
+    best_frame_path: str
+
+    # Baretsiz alarm varsa (opsiyonel)
+    has_alarm: bool = False
+    best_alarm_conf: Optional[float] = None
+    best_alarm_time_sec: Optional[float] = None
+    best_alarm_time_str: Optional[str] = None
+    best_alarm_frame_path: Optional[str] = None
 
 
 @dataclass
@@ -37,51 +42,66 @@ class AnalysisResult:
     people: List[PersonResult]
 
 
+@dataclass
+class _Snap:
+    conf: float = -1.0
+    time_sec: float = 0.0
+    path: str = ""
+
+
 class VideoAnalyzer:
+    """
+    ALL-TRACKS rapor:
+      - Tüm track_id'ler rapora girer (hits/conf eşiği yok)
+      - Baretli için de max-conf kare kaydedilir
+      - Baretsiz alarm (is_alarm=True) için ayrıca alarm_best kaydedilir
+
+    Not: init imzası geriye uyumlu tutuldu (app/run_cli kırılmasın).
+    """
+
     def __init__(
         self,
         detector: YoloTrackedHelmetDetector,
         sample_every_sec: float = 0.1,
         bbox_scale: float = 1.2,
-        max_missed_samples: int = 15,  # 0.1s örnekleme -> 1.5s yoksa finalize
-        min_hits: int = 3,
+        max_missed_samples: int = 15,          # geriye uyum için var (kullanılmıyor)
+        min_hits: int = 3,                      # geriye uyum için var (kullanılmıyor)
+        store_full_frame_for_alarm: bool = True,  # geriye uyum için var (kullanılmıyor)
+        include_all_tracks: bool = True,        # NEW: varsayılan True
     ):
         self.detector = detector
         self.sample_every_sec = sample_every_sec
         self.bbox_scale = bbox_scale
-        self.max_missed_samples = max_missed_samples
-        self.min_hits = min_hits
+        self.include_all_tracks = include_all_tracks
 
-        self._states: Dict[int, TrackState] = {}
-        self._finalized: List[TrackState] = []
+        self._hits: Dict[int, int] = {}
+        self._votes: Dict[int, Dict[str, int]] = {}
+        self._best_by_label: Dict[int, Dict[str, _Snap]] = {}
+        self._has_alarm: Dict[int, bool] = {}
+        self._best_alarm: Dict[int, _Snap] = {}
 
-    def _finalize_state(self, st: TrackState, frames_dir: str) -> Optional[PersonResult]:
-        if st.hits < self.min_hits:
-            return None
+    def _ensure(self, tid: int):
+        if tid not in self._hits:
+            self._hits[tid] = 0
+            self._votes[tid] = {"baretli": 0, "baretsiz": 0}
+            self._best_by_label[tid] = {"baretli": _Snap(), "baretsiz": _Snap()}
+            self._has_alarm[tid] = False
+            self._best_alarm[tid] = _Snap()
 
-        label = st.final_label()
-        pr = PersonResult(
-            track_id=st.track_id,
-            final_label=label,
-            hits=st.hits,
-            score_baretli=st.score_baretli,
-            score_baretsiz=st.score_baretsiz,
+    def _write_best(self, frames_dir: str, tid: int, tag: str,
+                    frame_bgr, dets: List[TrackedDetection]) -> str:
+        # Aynı isim: üstüne yazar, klasör şişmez
+        annotated = annotate_frame(
+            frame_bgr,
+            dets,
+            bbox_scale=self.bbox_scale,
+            focus_track_id=tid,      # <-- sadece bu ID
+            show_others=False
         )
 
-        if label == "baretsiz" and st.best_baretsiz_frame is not None and st.best_baretsiz_dets is not None:
-            annotated = annotate_frame(st.best_baretsiz_frame, st.best_baretsiz_dets, bbox_scale=self.bbox_scale)
-            tsec = float(st.best_baretsiz_time_sec or 0.0)
-            tstr = format_time(tsec)
-            fname = f"id_{st.track_id:05d}_t_{tsec:.2f}s_conf_{st.best_baretsiz_conf:.2f}.jpg"
-            fpath = os.path.join(frames_dir, fname)
-            cv2.imwrite(fpath, annotated)
-
-            pr.best_baretsiz_conf = float(st.best_baretsiz_conf)
-            pr.best_baretsiz_time_sec = tsec
-            pr.best_baretsiz_time_str = tstr
-            pr.best_frame_path = fpath
-
-        return pr
+        fpath = os.path.join(frames_dir, f"id_{tid:05d}_{tag}_best.jpg")
+        cv2.imwrite(fpath, annotated)
+        return fpath
 
     def analyze(
         self,
@@ -93,10 +113,12 @@ class VideoAnalyzer:
         frames_dir = os.path.join(out_dir, "frames")
         os.makedirs(frames_dir, exist_ok=True)
 
-        # Yeni video için state reset
-        self._states.clear()
-        self._finalized.clear()
         self.detector.reset_tracker()
+        self._hits.clear()
+        self._votes.clear()
+        self._best_by_label.clear()
+        self._has_alarm.clear()
+        self._best_alarm.clear()
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -107,8 +129,6 @@ class VideoAnalyzer:
         step = max(1, int(round(fps * self.sample_every_sec)))
 
         frame_idx = 0
-        sample_idx = 0
-
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -118,54 +138,29 @@ class VideoAnalyzer:
                 time_sec = frame_idx / fps
                 dets = self.detector.detect(frame)
 
-                # Bu örnek frame’de görünen ID seti
-                seen_ids = set()
-
-                # Update seen states
                 for d in dets:
-                    seen_ids.add(d.track_id)
-                    st = self._states.get(d.track_id)
-                    if st is None:
-                        st = TrackState(track_id=d.track_id)
-                        self._states[d.track_id] = st
+                    tid = int(d.track_id)
+                    self._ensure(tid)
 
-                    st.hits += 1
-                    st.missed = 0
-                    st.last_seen_sample_idx = sample_idx
+                    self._hits[tid] += 1
+                    if d.label in self._votes[tid]:
+                        self._votes[tid][d.label] += 1
 
-                    st.vote(d)
+                    # label bazlı best (baretli + baretsiz)
+                    snap = self._best_by_label[tid][d.label]
+                    if d.conf > snap.conf:
+                        snap.conf = float(d.conf)
+                        snap.time_sec = float(time_sec)
+                        snap.path = self._write_best(frames_dir, tid, d.label, frame, dets)
 
-                    # baretsiz maksimum anı sakla (bu frame’in tüm dets’i ile)
-                    if d.label == "baretsiz" and d.conf > st.best_baretsiz_conf:
-                        st.best_baretsiz_conf = d.conf
-                        st.best_baretsiz_time_sec = time_sec
-                        st.best_baretsiz_frame = frame.copy()
-                        st.best_baretsiz_dets = [
-                            TrackedDetection(
-                                track_id=dd.track_id,
-                                xyxy=dd.xyxy.copy(),
-                                conf=dd.conf,
-                                label=dd.label,
-                                cls_id=dd.cls_id,
-                            )
-                            for dd in dets
-                        ]
-
-                # Miss update (görünmeyenler)
-                to_finalize = []
-                for tid, st in self._states.items():
-                    if tid not in seen_ids:
-                        st.missed += 1
-                        if st.missed > self.max_missed_samples:
-                            to_finalize.append(tid)
-
-                # Finalize
-                for tid in to_finalize:
-                    st = self._states.pop(tid, None)
-                    if st is not None:
-                        self._finalized.append(st)
-
-                sample_idx += 1
+                    # alarm bazlı best
+                    if bool(getattr(d, "is_alarm", False)):
+                        self._has_alarm[tid] = True
+                        asnap = self._best_alarm[tid]
+                        if d.conf > asnap.conf:
+                            asnap.conf = float(d.conf)
+                            asnap.time_sec = float(time_sec)
+                            asnap.path = self._write_best(frames_dir, tid, "alarm", frame, dets)
 
             frame_idx += 1
             if progress_cb and total_frames > 0:
@@ -173,21 +168,49 @@ class VideoAnalyzer:
 
         cap.release()
 
-        # Kalanları finalize et
-        for st in list(self._states.values()):
-            self._finalized.append(st)
-        self._states.clear()
-
-        # Person results
+        # Tüm track'ler rapora
         people: List[PersonResult] = []
-        for st in self._finalized:
-            pr = self._finalize_state(st, frames_dir)
-            if pr is not None:
-                people.append(pr)
+        for tid in sorted(self._hits.keys()):
+            hits = self._hits[tid]
+            votes = self._votes[tid]
+
+            has_alarm = bool(self._has_alarm.get(tid, False))
+            final_label = "baretsiz" if votes["baretsiz"] > votes["baretli"] else "baretli"
+            if has_alarm:
+                final_label = "baretsiz"
+
+            snap_final = self._best_by_label[tid][final_label]
+            if snap_final.conf < 0 or not snap_final.path:
+                # edge-case fallback
+                other = "baretli" if final_label == "baretsiz" else "baretsiz"
+                snap_final = self._best_by_label[tid][other]
+            if snap_final.conf < 0 or not snap_final.path:
+                continue  # çok nadir
+
+            pr = PersonResult(
+                track_id=tid,
+                final_label=final_label,
+                hits=hits,
+                best_conf=float(snap_final.conf),
+                best_time_sec=float(snap_final.time_sec),
+                best_time_str=format_time(float(snap_final.time_sec)),
+                best_frame_path=snap_final.path,
+                has_alarm=has_alarm,
+            )
+
+            if has_alarm:
+                asnap = self._best_alarm[tid]
+                if asnap.conf >= 0 and asnap.path:
+                    pr.best_alarm_conf = float(asnap.conf)
+                    pr.best_alarm_time_sec = float(asnap.time_sec)
+                    pr.best_alarm_time_str = format_time(float(asnap.time_sec))
+                    pr.best_alarm_frame_path = asnap.path
+
+            people.append(pr)
 
         total_people = len(people)
-        baretli_count = sum(1 for p in people if p.final_label == "baretli")
         baretsiz_count = sum(1 for p in people if p.final_label == "baretsiz")
+        baretli_count = total_people - baretsiz_count
 
         result = AnalysisResult(
             video_path=video_path,
@@ -199,10 +222,8 @@ class VideoAnalyzer:
             people=people,
         )
 
-        # write reports
         self._write_json(result, os.path.join(out_dir, "report.json"))
         self._write_csv(result, os.path.join(out_dir, "report.csv"))
-
         return result
 
     def _write_json(self, result: AnalysisResult, path: str) -> None:
@@ -214,16 +235,20 @@ class VideoAnalyzer:
             w = csv.writer(f)
             w.writerow([
                 "track_id", "final_label", "hits",
-                "score_baretli", "score_baretsiz",
-                "best_baretsiz_conf", "best_baretsiz_time_sec", "best_baretsiz_time_str",
-                "best_frame_path"
+                "best_conf", "best_time_sec", "best_time_str", "best_frame_path",
+                "has_alarm", "best_alarm_conf", "best_alarm_time_sec", "best_alarm_time_str", "best_alarm_frame_path"
             ])
             for p in result.people:
                 w.writerow([
                     p.track_id, p.final_label, p.hits,
-                    f"{p.score_baretli:.6f}", f"{p.score_baretsiz:.6f}",
-                    "" if p.best_baretsiz_conf is None else f"{p.best_baretsiz_conf:.3f}",
-                    "" if p.best_baretsiz_time_sec is None else f"{p.best_baretsiz_time_sec:.3f}",
-                    p.best_baretsiz_time_str or "",
-                    p.best_frame_path or "",
+                    f"{p.best_conf:.3f}",
+                    f"{p.best_time_sec:.3f}",
+                    p.best_time_str,
+                    p.best_frame_path,
+                    "1" if p.has_alarm else "0",
+                    "" if p.best_alarm_conf is None else f"{p.best_alarm_conf:.3f}",
+                    "" if p.best_alarm_time_sec is None else f"{p.best_alarm_time_sec:.3f}",
+                    p.best_alarm_time_str or "",
+                    p.best_alarm_frame_path or "",
                 ])
+

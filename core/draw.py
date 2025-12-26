@@ -28,18 +28,43 @@ def annotate_frame(
     frame_bgr: np.ndarray,
     dets: List[TrackedDetection],
     bbox_scale: float = 1.2,
+    focus_track_id: int | None = None,
+    show_others: bool = False,
+    **kwargs,  # <-- önemli: beklenmeyen keyword'leri yutar
 ) -> np.ndarray:
     out = frame_bgr.copy()
     h, w = out.shape[:2]
 
     for d in dets:
+        if focus_track_id is not None and d.track_id != focus_track_id and not show_others:
+            continue
+
         bb = expand_bbox(d.xyxy, bbox_scale, w, h)
         x1, y1, x2, y2 = map(int, bb.tolist())
 
-        color = (0, 255, 0) if d.label == "baretli" else (0, 0, 255)
+        is_alarm = bool(getattr(d, "is_alarm", False))
 
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        txt = f"ID:{d.track_id} {d.label} {d.conf:.2f}"
+        # focus dışındakiler soluk olsun istersen
+        if focus_track_id is not None and d.track_id != focus_track_id and show_others:
+            color = (180, 180, 180)
+            thickness = 1
+            tag = ""
+        else:
+            if is_alarm:
+                color = (0, 0, 255)       # kırmızı
+                thickness = 4
+                tag = "ALARM"
+            elif d.label == "baretsiz":
+                color = (0, 165, 255)     # turuncu
+                thickness = 3
+                tag = "ADAY"
+            else:
+                color = (0, 255, 0)       # yeşil
+                thickness = 2
+                tag = ""
+
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+        txt = f"{tag} ID:{d.track_id} {d.label} {d.conf:.2f}".strip()
         cv2.putText(out, txt, (x1, max(0, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 

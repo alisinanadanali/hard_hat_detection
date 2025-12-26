@@ -37,6 +37,12 @@ def default_output_dir_for_video(video_path: Path) -> Path:
     return out
 
 
+def _set_if_has(obj, name: str, value):
+    """Detector patch'lerinde attribute'lar varsa set et, yoksa sessiz geç."""
+    if hasattr(obj, name):
+        setattr(obj, name, value)
+
+
 class AnalyzeWorker(QObject):
     progress = Signal(int)        # 0..100
     log = Signal(str)
@@ -52,26 +58,54 @@ class AnalyzeWorker(QObject):
     @Slot()
     def run(self):
         try:
+            import core.analyzer as analyzer_mod
+            self.log.emit(f"[DEBUG] analyzer.py path = {analyzer_mod.__file__}")
+            self.log.emit(f"[DEBUG] VideoAnalyzer init args = {analyzer_mod.VideoAnalyzer.__init__.__code__.co_varnames}")
+
             self.log.emit(f"Video: {self.video_path}")
             self.log.emit(f"Model: {self.model_path}")
             self.log.emit(f"Çıktı: {self.out_dir}")
-            self.log.emit("Tracker: botsort.yaml | imgsz=1024 | sample=0.1s")
 
+            # Yeni pipeline notu (net ve kısa)
+            self.log.emit("Ayarlar: tracker=botsort | imgsz=1024 | sample=0.1s")
+            self.log.emit("Mantık: 1 kişi = 1 alarm | alarm karesi = max conf (alarm frameleri içinde)")
+
+            # Tracker aday eşiği düşük; FP'yi biz filtreliyoruz
             detector = YoloTrackedHelmetDetector(
                 model_path=self.model_path,
                 imgsz=1024,
-                conf_thres=0.25,
+                conf_thres=0.15,   # <-- önemli (önceden 0.25)
                 iou_thres=0.45,
                 device=None,                 # istersen "cuda:0"
                 tracker_cfg="botsort.yaml",
             )
 
+            # ---- Detector tuning (GUI için sabit, run_cli ile aynı yaklaşım) ----
+            if hasattr(detector, "class_conf") and isinstance(detector.class_conf, dict):
+                detector.class_conf["baretli"] = 0.55
+                detector.class_conf["baretsiz"] = 0.75
+
+            _set_if_has(detector, "IMMEDIATE_BARETSIZ_CONF", 0.88)
+            _set_if_has(detector, "BARETSIZ_STREAK_N", 3)
+
+            _set_if_has(detector, "border_margin", 8)
+            _set_if_has(detector, "min_w", 12)
+            _set_if_has(detector, "min_h", 12)
+            _set_if_has(detector, "min_area", 144)
+            _set_if_has(detector, "ar_min", 0.6)
+            _set_if_has(detector, "ar_max", 1.8)
+
+            _set_if_has(detector, "MERGE_IOU", 0.75)
+            _set_if_has(detector, "MERGE_MAX_GAP", 15)
+
+            # Analyzer: alarm karesi için full frame saklansın (annotate yazdırmak için)
             analyzer = VideoAnalyzer(
                 detector=detector,
                 sample_every_sec=0.1,
                 bbox_scale=1.2,
                 max_missed_samples=15,
                 min_hits=3,
+                store_full_frame_for_alarm=True,  # <-- yeni
             )
 
             def cb(p):
@@ -121,7 +155,7 @@ class MainWindow(QMainWindow):
         self.lbl_summary.setStyleSheet("font-weight: 600;")
         layout.addWidget(self.lbl_summary)
 
-        # Table (helmetless)
+        # Table
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Track ID", "Sonuç", "Conf", "Zaman (s)", "Kare Yolu"])
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -129,7 +163,7 @@ class MainWindow(QMainWindow):
 
         # Preview + open buttons
         row2 = QHBoxLayout()
-        self.preview = QLabel("Kare önizleme (baretsiz maksimum conf)")
+        self.preview = QLabel("Kare önizleme (baretsiz alarm için seçilen max-conf kare)")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumHeight(240)
         self.preview.setStyleSheet("border: 1px solid #999;")
@@ -239,23 +273,36 @@ class MainWindow(QMainWindow):
             f"Sonuç: Toplam={result.total_people} | Baretli={result.baretli_count} | Baretsiz={result.baretsiz_count}"
         )
 
-        # Fill table: show all people, but baretsizleri üstte görmek istersen sıralayabiliriz
+       # Fill table
         people = list(result.people)
-        people.sort(key=lambda p: (p.final_label != "baretsiz", -(p.best_baretsiz_conf or 0.0)))
+        people.sort(key=lambda p: (p.final_label != "baretsiz", -float(getattr(p, "best_conf", getattr(p, "best_baretsiz_conf", 0.0)) or 0.0)))
+
+        def _get(obj, name, default=None):
+            return getattr(obj, name, default)
 
         self.table.setRowCount(len(people))
         for r, p in enumerate(people):
             self.table.setItem(r, 0, QTableWidgetItem(str(p.track_id)))
             self.table.setItem(r, 1, QTableWidgetItem(p.final_label))
-            self.table.setItem(r, 2, QTableWidgetItem("" if p.best_baretsiz_conf is None else f"{p.best_baretsiz_conf:.2f}"))
-            self.table.setItem(r, 3, QTableWidgetItem("" if p.best_baretsiz_time_sec is None else f"{p.best_baretsiz_time_sec:.2f}"))
-            self.table.setItem(r, 4, QTableWidgetItem(p.best_frame_path or ""))
+
+            conf = _get(p, "best_conf", _get(p, "best_baretsiz_conf", None))
+            tsec = _get(p, "best_time_sec", _get(p, "best_baretsiz_time_sec", None))
+            path = _get(p, "best_frame_path", "")
+
+            self.table.setItem(r, 2, QTableWidgetItem("" if conf is None else f"{float(conf):.2f}"))
+            self.table.setItem(r, 3, QTableWidgetItem("" if tsec is None else f"{float(tsec):.2f}"))
+            self.table.setItem(r, 4, QTableWidgetItem(path or ""))
 
         # Otomatik olarak ilk baretsiz satıra odaklan
         for r in range(self.table.rowCount()):
             if self.table.item(r, 1).text() == "baretsiz":
                 self.table.selectRow(r)
                 break
+
+        if result.baretsiz_count == 0:
+            self.preview.setText("Baretsiz alarm bulunamadı. (Kare yok)")
+        else:
+            self.preview.setText("Baretsiz alarm seç: tablodan bir satır seç.")
 
     @Slot(str)
     def on_error(self, msg: str):
@@ -275,7 +322,6 @@ class MainWindow(QMainWindow):
             self.btn_open_file.setEnabled(False)
             return
 
-        # 5. kolon: frame path
         row = self.table.currentRow()
         path_item = self.table.item(row, 4)
         frame_path = path_item.text().strip() if path_item else ""
@@ -317,3 +363,4 @@ if __name__ == "__main__":
     w.resize(1100, 750)
     w.show()
     sys.exit(app.exec())
+
