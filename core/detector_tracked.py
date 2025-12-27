@@ -200,10 +200,29 @@ class YoloTrackedHelmetDetector:
             self._cleanup_states()
             return []
 
-        # tracker id yoksa (bazı edge-case) boş dön
         if getattr(res.boxes, "id", None) is None:
-            self._cleanup_states()
-            return []
+            # Tracker ID üretemedi ama detection var: varlık sinyali dönelim.
+            out: List[TrackedDetection] = []
+            for b in res.boxes:
+                cls_id = int(b.cls.item())
+                conf = float(b.conf.item())
+                raw_name = self.names.get(cls_id, str(cls_id))
+                label = self._canonical_label(raw_name)
+                if label is None:
+                    continue
+
+                xyxy = b.xyxy[0].detach().cpu().numpy().astype(np.float32)
+                out.append(
+                    TrackedDetection(
+                        track_id=-1,  # geçici idsiz
+                        xyxy=xyxy,
+                        conf=conf,
+                        label=label,
+                        cls_id=cls_id,
+                    )
+                )
+            return out
+
 
         ids = res.boxes.id.detach().cpu().numpy().astype(int)
 
@@ -290,6 +309,78 @@ class YoloTrackedHelmetDetector:
 
         self._cleanup_states()
         return out
+    
+    def detect_only(self, frame_bgr: np.ndarray) -> List[TrackedDetection]:
+        """
+        Tracker olmadan sadece YOLO detect.
+        Bazı ultralytics sürümlerinde predict() list/generator/tek Result dönebilir.
+        Bu yüzden sonuç okuması robust yapıldı.
+        track_id = -1 döner.
+        """
+        pred = self.model.predict(
+            source=frame_bgr,
+            conf=self.conf_thres,
+            iou=self.iou_thres,
+            imgsz=self.imgsz,
+            device=self.device,
+            verbose=False,
+            stream=False,   # <-- özellikle ekledim
+        )
+
+        # pred None olabilir -> boş dön
+        if pred is None:
+            return []
+
+        # pred list / generator / tek Result olabilir
+        res = None
+        if isinstance(pred, list):
+            if len(pred) == 0:
+                return []
+            res = pred[0]
+        else:
+            # iterator/generator ise ilk sonucu çek
+            try:
+                res = next(iter(pred))
+            except Exception:
+                # tek Result olabilir
+                res = pred
+
+        if res is None or res.boxes is None or len(res.boxes) == 0:
+            return []
+
+        # names dict veya list olabilir
+        names = getattr(self.model, "names", None) or self.names
+        out: List[TrackedDetection] = []
+
+        for b in res.boxes:
+            cls_id = int(b.cls.item())
+            conf = float(b.conf.item())
+
+            if isinstance(names, dict):
+                raw_name = names.get(cls_id, str(cls_id))
+            elif isinstance(names, (list, tuple)):
+                raw_name = names[cls_id] if 0 <= cls_id < len(names) else str(cls_id)
+            else:
+                raw_name = str(cls_id)
+
+            label = self._canonical_label(raw_name)
+            if label is None:
+                continue
+
+            xyxy = b.xyxy[0].detach().cpu().numpy().astype(np.float32)
+            out.append(
+                TrackedDetection(
+                    track_id=-1,  # SEARCH modunda ID yok
+                    xyxy=xyxy,
+                    conf=conf,
+                    label=label,
+                    cls_id=cls_id,
+                )
+            )
+
+        return out
+
+
 
     def _cleanup_states(self):
         # stale logical states temizle

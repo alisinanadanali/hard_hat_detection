@@ -8,7 +8,7 @@ from PySide6.QtGui import QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QTextEdit,
-    QTableWidget, QTableWidgetItem, QMessageBox
+    QTableWidget, QTableWidgetItem, QMessageBox, QCheckBox, QComboBox
 )
 
 from core.detector_tracked import YoloTrackedHelmetDetector
@@ -155,6 +155,27 @@ class MainWindow(QMainWindow):
         self.lbl_summary.setStyleSheet("font-weight: 600;")
         layout.addWidget(self.lbl_summary)
 
+        # Filters / Sorting
+        row_sort = QHBoxLayout()
+
+        self.chk_show_baretli = QCheckBox("Baretli kayıtları göster")
+        self.chk_show_baretli.setChecked(True)
+
+        self.cmb_sort = QComboBox()
+        self.cmb_sort.addItems([
+            "Baretsiz üstte, zaman (grup içi)",
+            "Zamana göre (tümü)",
+            "Baretsiz üstte, conf",
+        ])
+
+        row_sort.addWidget(self.chk_show_baretli)
+        row_sort.addWidget(QLabel("Sıralama:"))
+        row_sort.addWidget(self.cmb_sort, 1)
+        layout.addLayout(row_sort)
+
+        self.chk_show_baretli.stateChanged.connect(self.refresh_table)
+        self.cmb_sort.currentIndexChanged.connect(self.refresh_table)
+
         # Table
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Track ID", "Sonuç", "Conf", "Zaman (s)", "Kare Yolu"])
@@ -195,6 +216,7 @@ class MainWindow(QMainWindow):
         # Thread placeholders
         self.thread: QThread | None = None
         self.worker: AnalyzeWorker | None = None
+        self._last_result = None
 
         # Validate model exists
         if not Path(self.model_path).exists():
@@ -273,6 +295,9 @@ class MainWindow(QMainWindow):
             f"Sonuç: Toplam={result.total_people} | Baretli={result.baretli_count} | Baretsiz={result.baretsiz_count}"
         )
 
+        self._last_result = result
+        self.refresh_table()
+
        # Fill table
         people = list(result.people)
         people.sort(key=lambda p: (p.final_label != "baretsiz", -float(getattr(p, "best_conf", getattr(p, "best_baretsiz_conf", 0.0)) or 0.0)))
@@ -292,17 +317,6 @@ class MainWindow(QMainWindow):
             self.table.setItem(r, 2, QTableWidgetItem("" if conf is None else f"{float(conf):.2f}"))
             self.table.setItem(r, 3, QTableWidgetItem("" if tsec is None else f"{float(tsec):.2f}"))
             self.table.setItem(r, 4, QTableWidgetItem(path or ""))
-
-        # Otomatik olarak ilk baretsiz satıra odaklan
-        for r in range(self.table.rowCount()):
-            if self.table.item(r, 1).text() == "baretsiz":
-                self.table.selectRow(r)
-                break
-
-        if result.baretsiz_count == 0:
-            self.preview.setText("Baretsiz alarm bulunamadı. (Kare yok)")
-        else:
-            self.preview.setText("Baretsiz alarm seç: tablodan bir satır seç.")
 
     @Slot(str)
     def on_error(self, msg: str):
@@ -355,6 +369,60 @@ class MainWindow(QMainWindow):
         p = Path(self.out_dir)
         if p.exists():
             QDesktopServices.openUrl(p.as_uri())
+
+    def refresh_table(self):
+        if self._last_result is None:
+            return
+
+        result = self._last_result
+        people = list(result.people)
+
+        # 1) filtre: baretsizler kesin kalsın, baretli checkbox'a bağlı
+        show_baretli = self.chk_show_baretli.isChecked()
+        if not show_baretli:
+            people = [p for p in people if p.final_label == "baretsiz"]
+
+        # 2) sıralama
+        mode = self.cmb_sort.currentText()
+
+        # güvenli alan okuma (eski/yeni uyum)
+        def _conf(p):
+            return float(getattr(p, "best_conf", getattr(p, "best_baretsiz_conf", 0.0)) or 0.0)
+
+        def _t(p):
+            return float(getattr(p, "best_time_sec", getattr(p, "best_baretsiz_time_sec", 1e18)) or 1e18)
+
+        if mode == "Zamana göre (tümü)":
+            # global zaman
+            people.sort(key=lambda p: _t(p))
+        elif mode == "Baretsiz üstte, conf":
+            # baretsiz grup üstte, her grubun içinde conf desc
+            people.sort(key=lambda p: (p.final_label != "baretsiz", -_conf(p)))
+        else:
+            # "Baretsiz üstte, zaman (grup içi)"
+            # baretsiz üstte; her grubun içinde zaman asc
+            people.sort(key=lambda p: (p.final_label != "baretsiz", _t(p)))
+
+        # 3) tabloya yaz
+        self.table.setRowCount(len(people))
+        for r, p in enumerate(people):
+            self.table.setItem(r, 0, QTableWidgetItem(str(p.track_id)))
+            self.table.setItem(r, 1, QTableWidgetItem(p.final_label))
+
+            conf = getattr(p, "best_conf", getattr(p, "best_baretsiz_conf", None))
+            tsec = getattr(p, "best_time_sec", getattr(p, "best_baretsiz_time_sec", None))
+            path = getattr(p, "best_frame_path", "")
+
+            self.table.setItem(r, 2, QTableWidgetItem("" if conf is None else f"{float(conf):.2f}"))
+            self.table.setItem(r, 3, QTableWidgetItem("" if tsec is None else f"{float(tsec):.2f}"))
+            self.table.setItem(r, 4, QTableWidgetItem(path or ""))
+
+    # otomatik odak: ilk baretsiz
+        for r in range(self.table.rowCount()):
+            if self.table.item(r, 1).text() == "baretsiz":
+                self.table.selectRow(r)
+            break
+
 
 
 if __name__ == "__main__":

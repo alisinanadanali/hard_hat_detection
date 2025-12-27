@@ -68,6 +68,8 @@ class VideoAnalyzer:
         min_hits: int = 3,                      # geriye uyum için var (kullanılmıyor)
         store_full_frame_for_alarm: bool = True,  # geriye uyum için var (kullanılmıyor)
         include_all_tracks: bool = True,        # NEW: varsayılan True
+        search_every_sec: float = 0.4,            # SEARCH modu örnekleme
+        empty_time_to_search_sec: float = 1.0,    # TRACK modunda bu kadar süre boşsa SEARCH'e geç
     ):
         self.detector = detector
         self.sample_every_sec = sample_every_sec
@@ -79,6 +81,8 @@ class VideoAnalyzer:
         self._best_by_label: Dict[int, Dict[str, _Snap]] = {}
         self._has_alarm: Dict[int, bool] = {}
         self._best_alarm: Dict[int, _Snap] = {}
+        self.search_every_sec = float(search_every_sec)
+        self.empty_time_to_search_sec = float(empty_time_to_search_sec)
 
     def _ensure(self, tid: int):
         if tid not in self._hits:
@@ -126,43 +130,120 @@ class VideoAnalyzer:
 
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        step = max(1, int(round(fps * self.sample_every_sec)))
+        
+        track_step = max(1, int(round(fps * self.sample_every_sec)))       # örn 0.1s
+        search_step = max(1, int(round(fps * self.search_every_sec)))      # örn 0.4s
 
-        frame_idx = 0
+        mode = "track"  # "track" | "search"
+        empty_track_streak = 0
+        search_retry_left = 0          # kaç kez hızlı tekrar denenecek
+        SEARCH_RETRY_N = 2             # 2 iyi başlangıç
+        jitter_flip = False            # search step'i 1 frame dither etmek için
+        warmup_left = 0
+        WARMUP_N = int(round(1.2 / self.sample_every_sec))  # ~1.2 saniye
+
+
+        frame_idx = 0                 # stream'de bulunduğumuz index (0..)
+        next_process_idx = 0          # bir sonraki "decode+YOLO" yapılacak frame index
+
         while True:
+            # 1) İşlemeyeceğimiz frame'leri decode etmeden geç
+            while frame_idx < next_process_idx:
+                if not cap.grab():    # decode yok (genelde çok hızlı)
+                    # döngü bitir
+                    frame_idx = None
+                    break
+                frame_idx += 1
+
+            if frame_idx is None:
+                break
+
+            # 2) Hedef frame'i decode et + işle
             ok, frame = cap.read()
             if not ok:
                 break
 
-            if frame_idx % step == 0:
-                time_sec = frame_idx / fps
+            cur_idx = frame_idx       # bu okunan frame'in index'i
+            frame_idx += 1
+            time_sec = cur_idx / fps
+
+            if mode == "search":
+                dets = self.detector.detect_only(frame)
+            else:
                 dets = self.detector.detect(frame)
 
-                for d in dets:
-                    tid = int(d.track_id)
-                    self._ensure(tid)
+            
+            for d in dets:
+                if d.track_id < 0:
+                    continue
+                tid = int(d.track_id)
+                self._ensure(tid)
 
-                    self._hits[tid] += 1
-                    if d.label in self._votes[tid]:
-                        self._votes[tid][d.label] += 1
+                self._hits[tid] += 1
+                if d.label in self._votes[tid]:
+                    self._votes[tid][d.label] += 1
 
-                    # label bazlı best (baretli + baretsiz)
-                    snap = self._best_by_label[tid][d.label]
-                    if d.conf > snap.conf:
-                        snap.conf = float(d.conf)
-                        snap.time_sec = float(time_sec)
-                        snap.path = self._write_best(frames_dir, tid, d.label, frame, dets)
+                # label bazlı best (baretli + baretsiz)
+                snap = self._best_by_label[tid][d.label]
+                if d.conf > snap.conf:
+                    snap.conf = float(d.conf)
+                    snap.time_sec = float(time_sec)
+                    snap.path = self._write_best(frames_dir, tid, d.label, frame, dets)
 
-                    # alarm bazlı best
-                    if bool(getattr(d, "is_alarm", False)):
-                        self._has_alarm[tid] = True
-                        asnap = self._best_alarm[tid]
-                        if d.conf > asnap.conf:
-                            asnap.conf = float(d.conf)
-                            asnap.time_sec = float(time_sec)
-                            asnap.path = self._write_best(frames_dir, tid, "alarm", frame, dets)
+                # alarm bazlı best
+                if bool(getattr(d, "is_alarm", False)):
+                    self._has_alarm[tid] = True
+                    asnap = self._best_alarm[tid]
+                    if d.conf > asnap.conf:
+                        asnap.conf = float(d.conf)
+                        asnap.time_sec = float(time_sec)
+                        asnap.path = self._write_best(frames_dir, tid, "alarm", frame, dets)
 
-            frame_idx += 1
+
+            # 3) Mod değişimi (SEARCH/TRACK)
+            if mode == "search":
+                if len(dets) > 0:
+                    mode = "track"
+                    warmup_left = WARMUP_N
+                    empty_track_streak = 0
+                    self.detector.reset_tracker()
+            else:
+                # mode == "track"
+                if len(dets) == 0:
+                    empty_track_streak += 1
+                    if empty_track_streak * self.sample_every_sec >= self.empty_time_to_search_sec:
+                        mode = "search"
+                        warmup_left = 0
+                else:
+                    empty_track_streak = 0
+
+
+            # 4) Bir sonraki işlenecek frame index'i (TRACK warmup + SEARCH burst/jitter)
+
+            if mode == "track":
+            # Track modunda her zaman sık örnekle
+                search_retry_left = 0
+                next_process_idx = cur_idx + track_step
+
+                # warmup sayacı (mode geçişinde set ediliyor)
+                if warmup_left > 0:
+                    warmup_left -= 1
+
+            else:
+                # SEARCH modu (detect_only çalışıyor)
+                if len(dets) == 0 and search_retry_left < SEARCH_RETRY_N:
+                # boş geldiyse kısa aralıkla tekrar dene
+                    search_retry_left += 1
+                    next_process_idx = cur_idx + track_step
+                else:
+                    # normal search adımı + jitter
+                    search_retry_left = 0
+                    jitter = 1 if jitter_flip else 0
+                    jitter_flip = not jitter_flip
+                    next_process_idx = cur_idx + search_step + jitter
+
+
+            # progress
             if progress_cb and total_frames > 0:
                 progress_cb(min(1.0, frame_idx / total_frames))
 
