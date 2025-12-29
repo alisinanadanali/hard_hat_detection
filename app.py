@@ -19,11 +19,11 @@ from core.analyzer import VideoAnalyzer
 
 
 # Ürün kuralı: UI/Rapor/Kare tarafında bu eşik altı ASLA görünmesin
-REPORT_MIN_CONF = 0.79
+REPORT_MIN_CONF = 0.70
 
 # Tracker bozulmasın / ID kopmasın diye: state güncellemek için daha düşük “iç eşik”
 # (UI/Rapor/Kare ile ilgisi yok)
-TRACK_KEEP_MIN_CONF = 0.25
+TRACK_KEEP_MIN_CONF = 0.15
 
 
 def resource_path(relative: str) -> Path:
