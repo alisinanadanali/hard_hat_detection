@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional
 import os
 import json
 import csv
+
 import cv2
 
 from .detector_tracked import YoloTrackedHelmetDetector, TrackedDetection
@@ -14,28 +15,31 @@ from .draw import annotate_frame, format_time
 @dataclass
 class PersonResult:
     track_id: int
-    final_label: str          # "baretli" | "baretsiz"
-    hits: int
+    final_label: str  # "baretli" | "baretsiz"
 
-    # Her kişi için: final_label'e ait maksimum conf kare
+    # Sadece rapor eşiği (>= report_min_conf) içindeki sayımlar:
+    hits_report: int
+
+    # UI için "final label" best'i (>= report_min_conf):
     best_conf: float
     best_time_sec: float
     best_time_str: str
     best_frame_path: str
 
-    # Baretsiz alarm varsa (opsiyonel)
-    has_alarm: bool = False
-    best_alarm_conf: Optional[float] = None
-    best_alarm_time_sec: Optional[float] = None
-    best_alarm_time_str: Optional[str] = None
-    best_alarm_frame_path: Optional[str] = None
+    # Detay (rapor eşiği içinde label bazlı):
+    best_baretli_conf: Optional[float] = None
+    best_baretli_time_sec: Optional[float] = None
+    best_baretli_frame_path: Optional[str] = None
+
+    best_baretsiz_conf: Optional[float] = None
+    best_baretsiz_time_sec: Optional[float] = None
+    best_baretsiz_frame_path: Optional[str] = None
 
 
 @dataclass
 class AnalysisResult:
     video_path: str
-    fps: float
-    sample_every_sec: float
+    out_dir: str
     total_people: int
     baretli_count: int
     baretsiz_count: int
@@ -51,12 +55,15 @@ class _Snap:
 
 class VideoAnalyzer:
     """
-    ALL-TRACKS rapor:
-      - Tüm track_id'ler rapora girer (hits/conf eşiği yok)
-      - Baretli için de max-conf kare kaydedilir
-      - Baretsiz alarm (is_alarm=True) için ayrıca alarm_best kaydedilir
+    Kurallar (Edge-case KALDIRILDI):
+      - report_min_conf (default 0.79) altı rapora/UI'a/KAYIT karelerine girmez.
+      - 0.79 altındaki tespitler tamamen yok sayılır (ne rapora, ne frames'e).
+      - Final label kararı SADECE report oyları üzerinden verilir.
+      - Rapora ancak en az 1 adet report det'i olan track girer.
 
-    Not: init imzası geriye uyumlu tutuldu (app/run_cli kırılmasın).
+    Not:
+      - Detector tarafı tracking için daha düşük conf ile çalışabilir (örn 0.15),
+        ama analyzer ürün çıktısı için 0.79 filtresini “kesin” uygular.
     """
 
     def __init__(
@@ -64,42 +71,48 @@ class VideoAnalyzer:
         detector: YoloTrackedHelmetDetector,
         sample_every_sec: float = 0.1,
         bbox_scale: float = 1.2,
-        max_missed_samples: int = 15,          # geriye uyum için var (kullanılmıyor)
-        min_hits: int = 3,                      # geriye uyum için var (kullanılmıyor)
-        store_full_frame_for_alarm: bool = True,  # geriye uyum için var (kullanılmıyor)
-        include_all_tracks: bool = True,        # NEW: varsayılan True
+        report_min_conf: float = 0.79,
+        store_baretli_frames: bool = False,
+        **kwargs,  # geri uyum
     ):
         self.detector = detector
-        self.sample_every_sec = sample_every_sec
-        self.bbox_scale = bbox_scale
-        self.include_all_tracks = include_all_tracks
+        self.sample_every_sec = float(sample_every_sec)
+        self.bbox_scale = float(bbox_scale)
 
-        self._hits: Dict[int, int] = {}
-        self._votes: Dict[int, Dict[str, int]] = {}
-        self._best_by_label: Dict[int, Dict[str, _Snap]] = {}
-        self._has_alarm: Dict[int, bool] = {}
-        self._best_alarm: Dict[int, _Snap] = {}
+        self.report_min_conf = float(report_min_conf)
+        self.store_baretli_frames = bool(store_baretli_frames)
+
+        # track istatistikleri (sadece report bandı)
+        self._hits_report: Dict[int, int] = {}
+        self._votes_report: Dict[int, Dict[str, int]] = {}
+
+        # report best (label bazlı)
+        self._best_report: Dict[int, Dict[str, _Snap]] = {}
 
     def _ensure(self, tid: int):
-        if tid not in self._hits:
-            self._hits[tid] = 0
-            self._votes[tid] = {"baretli": 0, "baretsiz": 0}
-            self._best_by_label[tid] = {"baretli": _Snap(), "baretsiz": _Snap()}
-            self._has_alarm[tid] = False
-            self._best_alarm[tid] = _Snap()
+        if tid not in self._hits_report:
+            self._hits_report[tid] = 0
+            self._votes_report[tid] = {"baretli": 0, "baretsiz": 0}
+            self._best_report[tid] = {"baretli": _Snap(), "baretsiz": _Snap()}
 
-    def _write_best(self, frames_dir: str, tid: int, tag: str,
-                    frame_bgr, dets: List[TrackedDetection]) -> str:
-        # Aynı isim: üstüne yazar, klasör şişmez
+    def _write_best(
+        self,
+        out_path: str,
+        tid: int,
+        label: str,
+        frame_bgr,
+        dets: List[TrackedDetection],
+        tag: str,
+    ) -> str:
         annotated = annotate_frame(
             frame_bgr,
             dets,
             bbox_scale=self.bbox_scale,
-            focus_track_id=tid,      # <-- sadece bu ID
-            show_others=False
+            focus_track_id=tid,
+            show_others=False,
         )
-
-        fpath = os.path.join(frames_dir, f"id_{tid:05d}_{tag}_best.jpg")
+        fname = f"id_{tid:05d}_{label}_{tag}_best.jpg"
+        fpath = os.path.join(out_path, fname)
         cv2.imwrite(fpath, annotated)
         return fpath
 
@@ -113,20 +126,19 @@ class VideoAnalyzer:
         frames_dir = os.path.join(out_dir, "frames")
         os.makedirs(frames_dir, exist_ok=True)
 
+        # reset
         self.detector.reset_tracker()
-        self._hits.clear()
-        self._votes.clear()
-        self._best_by_label.clear()
-        self._has_alarm.clear()
-        self._best_alarm.clear()
+        self._hits_report.clear()
+        self._votes_report.clear()
+        self._best_report.clear()
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Video açılamadı: {video_path}")
 
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        step = max(1, int(round(fps * self.sample_every_sec)))
+        step = max(1, int(round(float(fps) * self.sample_every_sec)))
 
         frame_idx = 0
         while True:
@@ -135,32 +147,38 @@ class VideoAnalyzer:
                 break
 
             if frame_idx % step == 0:
-                time_sec = frame_idx / fps
+                time_sec = frame_idx / float(fps)
                 dets = self.detector.detect(frame)
 
                 for d in dets:
+                    # ÜRÜN KURALI: 0.79 altı tamamen yok say
+                    if float(d.conf) < self.report_min_conf:
+                        continue
+
                     tid = int(d.track_id)
                     self._ensure(tid)
 
-                    self._hits[tid] += 1
-                    if d.label in self._votes[tid]:
-                        self._votes[tid][d.label] += 1
+                    self._hits_report[tid] += 1
 
-                    # label bazlı best (baretli + baretsiz)
-                    snap = self._best_by_label[tid][d.label]
-                    if d.conf > snap.conf:
-                        snap.conf = float(d.conf)
-                        snap.time_sec = float(time_sec)
-                        snap.path = self._write_best(frames_dir, tid, d.label, frame, dets)
+                    if d.label in self._votes_report[tid]:
+                        self._votes_report[tid][d.label] += 1
 
-                    # alarm bazlı best
-                    if bool(getattr(d, "is_alarm", False)):
-                        self._has_alarm[tid] = True
-                        asnap = self._best_alarm[tid]
-                        if d.conf > asnap.conf:
-                            asnap.conf = float(d.conf)
-                            asnap.time_sec = float(time_sec)
-                            asnap.path = self._write_best(frames_dir, tid, "alarm", frame, dets)
+                    # best snapshot güncelle (label bazlı)
+                    if d.label == "baretli" and not self.store_baretli_frames:
+                        # conf/time sakla ama dosya yazma
+                        snap_r = self._best_report[tid]["baretli"]
+                        if d.conf > snap_r.conf:
+                            snap_r.conf = float(d.conf)
+                            snap_r.time_sec = float(time_sec)
+                            snap_r.path = ""
+                    else:
+                        snap_r = self._best_report[tid][d.label]
+                        if d.conf > snap_r.conf:
+                            snap_r.conf = float(d.conf)
+                            snap_r.time_sec = float(time_sec)
+                            snap_r.path = self._write_best(
+                                frames_dir, tid, d.label, frame, dets, tag="report"
+                            )
 
             frame_idx += 1
             if progress_cb and total_frames > 0:
@@ -168,43 +186,43 @@ class VideoAnalyzer:
 
         cap.release()
 
-        # Tüm track'ler rapora
+        # --- rapor üret (sadece report hit'i olanlar) ---
         people: List[PersonResult] = []
-        for tid in sorted(self._hits.keys()):
-            hits = self._hits[tid]
-            votes = self._votes[tid]
 
-            has_alarm = bool(self._has_alarm.get(tid, False))
+        for tid in sorted(self._hits_report.keys()):
+            if self._hits_report.get(tid, 0) <= 0:
+                continue
+
+            votes = self._votes_report[tid]
             final_label = "baretsiz" if votes["baretsiz"] > votes["baretli"] else "baretli"
-            if has_alarm:
-                final_label = "baretsiz"
 
-            snap_final = self._best_by_label[tid][final_label]
-            if snap_final.conf < 0 or not snap_final.path:
-                # edge-case fallback
-                other = "baretli" if final_label == "baretsiz" else "baretsiz"
-                snap_final = self._best_by_label[tid][other]
-            if snap_final.conf < 0 or not snap_final.path:
-                continue  # çok nadir
+            snap_final = self._best_report[tid][final_label]
+            best_conf = float(snap_final.conf if snap_final.conf >= 0 else 0.0)
+            best_time_sec = float(snap_final.time_sec)
+            best_path = snap_final.path or ""
 
             pr = PersonResult(
                 track_id=tid,
                 final_label=final_label,
-                hits=hits,
-                best_conf=float(snap_final.conf),
-                best_time_sec=float(snap_final.time_sec),
-                best_time_str=format_time(float(snap_final.time_sec)),
-                best_frame_path=snap_final.path,
-                has_alarm=has_alarm,
+                hits_report=int(self._hits_report.get(tid, 0)),
+                best_conf=best_conf,
+                best_time_sec=best_time_sec,
+                best_time_str=format_time(best_time_sec),
+                best_frame_path=best_path,
             )
 
-            if has_alarm:
-                asnap = self._best_alarm[tid]
-                if asnap.conf >= 0 and asnap.path:
-                    pr.best_alarm_conf = float(asnap.conf)
-                    pr.best_alarm_time_sec = float(asnap.time_sec)
-                    pr.best_alarm_time_str = format_time(float(asnap.time_sec))
-                    pr.best_alarm_frame_path = asnap.path
+            # label bazlı report best (dosya yazılmamış olabilir)
+            br = self._best_report[tid]["baretli"]
+            if br.conf >= 0:
+                pr.best_baretli_conf = float(br.conf)
+                pr.best_baretli_time_sec = float(br.time_sec)
+                pr.best_baretli_frame_path = br.path or ""
+
+            bzr = self._best_report[tid]["baretsiz"]
+            if bzr.conf >= 0:
+                pr.best_baretsiz_conf = float(bzr.conf)
+                pr.best_baretsiz_time_sec = float(bzr.time_sec)
+                pr.best_baretsiz_frame_path = bzr.path or ""
 
             people.append(pr)
 
@@ -214,8 +232,7 @@ class VideoAnalyzer:
 
         result = AnalysisResult(
             video_path=video_path,
-            fps=fps,
-            sample_every_sec=self.sample_every_sec,
+            out_dir=out_dir,
             total_people=total_people,
             baretli_count=baretli_count,
             baretsiz_count=baretsiz_count,
@@ -224,31 +241,38 @@ class VideoAnalyzer:
 
         self._write_json(result, os.path.join(out_dir, "report.json"))
         self._write_csv(result, os.path.join(out_dir, "report.csv"))
+
         return result
 
     def _write_json(self, result: AnalysisResult, path: str) -> None:
+        data = asdict(result)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(asdict(result), f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
     def _write_csv(self, result: AnalysisResult, path: str) -> None:
-        with open(path, "w", encoding="utf-8", newline="") as f:
+        with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
-                "track_id", "final_label", "hits",
+                "track_id", "final_label",
+                "hits_report",
                 "best_conf", "best_time_sec", "best_time_str", "best_frame_path",
-                "has_alarm", "best_alarm_conf", "best_alarm_time_sec", "best_alarm_time_str", "best_alarm_frame_path"
+                "best_baretli_conf", "best_baretli_time_sec", "best_baretli_frame_path",
+                "best_baretsiz_conf", "best_baretsiz_time_sec", "best_baretsiz_frame_path",
             ])
             for p in result.people:
                 w.writerow([
-                    p.track_id, p.final_label, p.hits,
+                    p.track_id, p.final_label,
+                    p.hits_report,
                     f"{p.best_conf:.3f}",
                     f"{p.best_time_sec:.3f}",
                     p.best_time_str,
                     p.best_frame_path,
-                    "1" if p.has_alarm else "0",
-                    "" if p.best_alarm_conf is None else f"{p.best_alarm_conf:.3f}",
-                    "" if p.best_alarm_time_sec is None else f"{p.best_alarm_time_sec:.3f}",
-                    p.best_alarm_time_str or "",
-                    p.best_alarm_frame_path or "",
+                    "" if p.best_baretli_conf is None else f"{p.best_baretli_conf:.3f}",
+                    "" if p.best_baretli_time_sec is None else f"{p.best_baretli_time_sec:.3f}",
+                    p.best_baretli_frame_path or "",
+                    "" if p.best_baretsiz_conf is None else f"{p.best_baretsiz_conf:.3f}",
+                    "" if p.best_baretsiz_time_sec is None else f"{p.best_baretsiz_time_sec:.3f}",
+                    p.best_baretsiz_frame_path or "",
                 ])
+
 

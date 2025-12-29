@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import subprocess
 from pathlib import Path
 from datetime import datetime
@@ -17,11 +18,15 @@ from core.detector_tracked import YoloTrackedHelmetDetector
 from core.analyzer import VideoAnalyzer
 
 
+# Ürün kuralı: UI/Rapor/Kare tarafında bu eşik altı ASLA görünmesin
+REPORT_MIN_CONF = 0.79
+
+# Tracker bozulmasın / ID kopmasın diye: state güncellemek için daha düşük “iç eşik”
+# (UI/Rapor/Kare ile ilgisi yok)
+TRACK_KEEP_MIN_CONF = 0.25
+
+
 def resource_path(relative: str) -> Path:
-    """
-    Geliştirmede: proje klasörü
-    PyInstaller paketlemede: sys._MEIPASS içi
-    """
     base = getattr(sys, "_MEIPASS", None)
     if base:
         return Path(base) / relative
@@ -40,9 +45,9 @@ def default_output_dir_for_video(video_path: Path) -> Path:
 
 
 def _set_if_has(obj, name: str, value):
-    """Detector patch'lerinde attribute'lar varsa set et, yoksa sessiz geç."""
     if hasattr(obj, name):
         setattr(obj, name, value)
+
 
 def _getattr(obj, name: str, default=None):
     return getattr(obj, name, default)
@@ -52,14 +57,10 @@ def make_proxy_video_10fps(
     src_video: str,
     cache_root: Path,
     target_fps: int = 10,
-    max_width: int | None = 1280,   # None -> sadece fps düşür
+    max_width: int | None = 1280,
     crf: int = 23,
     preset: str = "veryfast",
 ) -> str | None:
-    """
-    FFmpeg ile 10 FPS proxy üretir ve cache'ler.
-    Cache anahtarı: dosya size + mtime + ayarlar.
-    """
     ffmpeg = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
     if not ffmpeg:
         return None
@@ -71,7 +72,6 @@ def make_proxy_video_10fps(
     cache_root.mkdir(parents=True, exist_ok=True)
 
     st = src.stat()
-    # mtime_ns daha sağlam
     key = f"{st.st_size}_{st.st_mtime_ns}_{target_fps}_{max_width}_{crf}_{preset}"
     proxy_path = cache_root / f"{src.stem}_proxy_{key}.mp4"
 
@@ -94,15 +94,14 @@ def make_proxy_video_10fps(
         "-an",
         str(proxy_path),
     ]
-
     subprocess.run(cmd, check=True)
     return str(proxy_path)
 
 
 class AnalyzeWorker(QObject):
-    progress = Signal(int)        # 0..100
+    progress = Signal(int)
     log = Signal(str)
-    finished = Signal(object, str)  # (result, out_dir)
+    finished = Signal(object, str)
     error = Signal(str)
 
     def __init__(
@@ -126,22 +125,26 @@ class AnalyzeWorker(QObject):
     @Slot()
     def run(self):
         try:
+            import core.detector_tracked as det_mod
             import core.analyzer as analyzer_mod
+
+            self.log.emit(f"[DEBUG] detector_tracked.py path = {det_mod.__file__}")
             self.log.emit(f"[DEBUG] analyzer.py path = {analyzer_mod.__file__}")
             self.log.emit(f"[DEBUG] VideoAnalyzer init args = {analyzer_mod.VideoAnalyzer.__init__.__code__.co_varnames}")
+            self.log.emit(f"[DEBUG] Detector init args = {det_mod.YoloTrackedHelmetDetector.__init__.__code__.co_varnames}")
 
             self.log.emit(f"Video: {self.video_path}")
             self.log.emit(f"Model: {self.model_path}")
             self.log.emit(f"Çıktı: {self.out_dir}")
             self.log.emit(f"Ayarlar: tracker=botsort | imgsz=1024 | sample={self.sample_every_sec:.2f}s")
+            self.log.emit(f"Kural: UI/Rapor/Kare >= {REPORT_MIN_CONF:.2f} (altı tamamen yok sayılır)")
 
             video_to_analyze = self.video_path
 
-            # ---- 10 FPS Proxy (opsiyonel) ----
             if self.use_proxy_10fps:
                 try:
                     out_dir_p = Path(self.out_dir)
-                    reports_root = out_dir_p.parent  # .../hardhat_reports
+                    reports_root = out_dir_p.parent
                     proxy_cache = reports_root / "_proxy_cache"
 
                     self.log.emit("Hızlandırma: 10 FPS proxy hazırlanıyor (FFmpeg)...")
@@ -149,7 +152,7 @@ class AnalyzeWorker(QObject):
                         src_video=self.video_path,
                         cache_root=proxy_cache,
                         target_fps=10,
-                        max_width=1280,   # sadece fps düşürmek istersen None yap
+                        max_width=1280,
                         crf=23,
                         preset="veryfast",
                     )
@@ -161,24 +164,29 @@ class AnalyzeWorker(QObject):
                 except Exception as e:
                     self.log.emit(f"Proxy üretilemedi -> normal video ile devam: {e}")
 
-            # Tracker aday eşiği düşük; FP'yi biz filtreliyoruz
             detector = YoloTrackedHelmetDetector(
                 model_path=self.model_path,
                 imgsz=1024,
-                conf_thres=0.15,   # <-- önemli (önceden 0.25)
+                conf_thres=0.15,   # tracker adayı (düşük kalabilir)
                 iou_thres=0.45,
-                device=None,                 # istersen "cuda:0"
+                device=None,
                 tracker_cfg="botsort.yaml",
             )
 
-            # ---- Detector tuning (GUI için sabit, run_cli ile aynı yaklaşım) ----
+            # 0.79 altı ürün çıktısı: görünmesin
+            _set_if_has(detector, "report_min_conf", REPORT_MIN_CONF)
+            _set_if_has(detector, "min_output_conf", REPORT_MIN_CONF)  # bazı sürümlerde bu isim kullanılıyor olabilir
+
+            # Track kopmasın diye (UI/rapor değil): düşük iç eşik
+            _set_if_has(detector, "edge_min_conf", TRACK_KEEP_MIN_CONF)         # bazı sürümlerde “edge_min_conf” vardı
+            _set_if_has(detector, "track_keep_min_conf", TRACK_KEEP_MIN_CONF)   # bazı sürümlerde bu isim tercih edilir
+
+            # class_conf varsa: tracking tarafını öldürmesin diye düşük tut
             if hasattr(detector, "class_conf") and isinstance(detector.class_conf, dict):
-                detector.class_conf["baretli"] = 0.55
-                detector.class_conf["baretsiz"] = 0.75
+                detector.class_conf["baretli"] = TRACK_KEEP_MIN_CONF
+                detector.class_conf["baretsiz"] = TRACK_KEEP_MIN_CONF
 
-            _set_if_has(detector, "IMMEDIATE_BARETSIZ_CONF", 0.88)
-            _set_if_has(detector, "BARETSIZ_STREAK_N", 3)
-
+            # geometri/kalite filtreleri
             _set_if_has(detector, "border_margin", 8)
             _set_if_has(detector, "min_w", 12)
             _set_if_has(detector, "min_h", 12)
@@ -189,33 +197,30 @@ class AnalyzeWorker(QObject):
             _set_if_has(detector, "MERGE_IOU", 0.75)
             _set_if_has(detector, "MERGE_MAX_GAP", 15)
 
-            init_vars = analyzer_mod.VideoAnalyzer.__init__.__code__.co_varnames
-
-            analyzer_kwargs = dict(
+            analyzer = VideoAnalyzer(
                 detector=detector,
                 sample_every_sec=self.sample_every_sec,
                 bbox_scale=1.2,
-                max_missed_samples=15,
-                min_hits=3,
             )
 
-            if "store_full_frame_for_alarm" in init_vars:
-                analyzer_kwargs["store_full_frame_for_alarm"] = True
+            # Analyzer seviyesinde de rapor eşiğini set et
+            _set_if_has(analyzer, "report_min_conf", REPORT_MIN_CONF)
 
-            # eğer core tarafında baretli kare kaydı opsiyonu eklediysen burada devreye girer
-            if "store_baretli_frames" in init_vars:
-                analyzer_kwargs["store_baretli_frames"] = self.store_baretli_frames
+            # “edge-case” kaldırıldığı için: varsa edge_min_conf’u report ile eşitle (range = boş)
+            _set_if_has(analyzer, "edge_min_conf", REPORT_MIN_CONF)
 
-            analyzer = VideoAnalyzer(**analyzer_kwargs)
+            # baretli kare yazma opsiyonu (varsa)
+            _set_if_has(analyzer, "store_baretli_frames", self.store_baretli_frames)
 
             def cb(p):
                 self.progress.emit(int(p * 100))
 
-            result = analyzer.analyze(self.video_path, self.out_dir, progress_cb=cb)
+            result = analyzer.analyze(video_to_analyze, self.out_dir, progress_cb=cb)
             self.finished.emit(result, self.out_dir)
 
         except Exception as e:
             self.error.emit(str(e))
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -225,16 +230,12 @@ class MainWindow(QMainWindow):
         self.video_path: str = ""
         self.model_path: str = str(default_model_path())
         self.out_dir: str = ""
-
-        # Son result'ı saklayıp UI değişiminde tabloyu yenileyelim
         self._last_result = None
 
-        # UI
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
 
-        # Top row: model + video select
         row1 = QHBoxLayout()
         self.lbl_model = QLabel(f"Model: {self.model_path}")
         self.btn_video = QPushButton("Video Seç")
@@ -252,14 +253,11 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         layout.addWidget(self.progress)
 
-        # Summary
         self.lbl_summary = QLabel("Sonuç: -")
         self.lbl_summary.setStyleSheet("font-weight: 600;")
         layout.addWidget(self.lbl_summary)
 
-        # ---- OPTIONS ROW ----
         opt = QHBoxLayout()
-
         opt.addWidget(QLabel("Sıralama:"))
         self.cmb_sort = QComboBox()
         self.cmb_sort.addItem("Güvene göre (yüksek → düşük)", "conf")
@@ -283,13 +281,11 @@ class MainWindow(QMainWindow):
         opt.addStretch(1)
         layout.addLayout(opt)
 
-        # Table
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Track ID", "Sonuç", "Conf", "Zaman (s)", "Kare Yolu"])
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table, 2)
 
-        # Preview + open buttons
         row2 = QHBoxLayout()
         self.preview = QLabel("Kare önizleme")
         self.preview.setAlignment(Qt.AlignCenter)
@@ -308,27 +304,22 @@ class MainWindow(QMainWindow):
         row2.addLayout(right, 1)
         layout.addLayout(row2)
 
-        # Log
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         layout.addWidget(self.log, 1)
 
-        # Signals
         self.btn_video.clicked.connect(self.choose_video)
         self.btn_start.clicked.connect(self.start_analysis)
         self.table.itemSelectionChanged.connect(self.on_table_select)
         self.btn_open_file.clicked.connect(self.open_selected_file)
         self.btn_open_folder.clicked.connect(self.open_output_folder)
 
-        # UI seçenek değişince tabloyu güncelle (analiz sonrası)
         self.cmb_sort.currentIndexChanged.connect(self.refresh_table_from_last)
         self.chk_show_baretli.stateChanged.connect(self.refresh_table_from_last)
 
-        # Thread placeholders
         self.thread: QThread | None = None
         self.worker: AnalyzeWorker | None = None
 
-        # Validate model exists
         if not Path(self.model_path).exists():
             QMessageBox.warning(
                 self,
@@ -347,14 +338,13 @@ class MainWindow(QMainWindow):
         )
         if not file_path:
             return
+
         self.video_path = file_path
         self.lbl_video.setText(f"Video: {self.video_path}")
 
-        # Default out dir next to video
         self.out_dir = str(default_output_dir_for_video(Path(self.video_path)))
         self.log_append(f"Çıktı klasörü hazırlandı: {self.out_dir}")
 
-        # Enable start if model exists
         self.btn_start.setEnabled(Path(self.model_path).exists())
 
     @Slot()
@@ -365,10 +355,9 @@ class MainWindow(QMainWindow):
         if not Path(self.model_path).exists():
             QMessageBox.warning(self, "Uyarı", f"Model bulunamadı:\n{self.model_path}")
             return
-        
+
         sample_every_sec = float(self.cmb_sample.currentData() or 0.10)
 
-        # UI lock
         self.btn_start.setEnabled(False)
         self.btn_video.setEnabled(False)
         self.btn_open_file.setEnabled(False)
@@ -381,7 +370,6 @@ class MainWindow(QMainWindow):
         self.lbl_summary.setText("Sonuç: (analiz ediliyor)")
         self._last_result = None
 
-        # Thread setup
         self.thread = QThread()
         self.worker = AnalyzeWorker(
             video_path=self.video_path,
@@ -399,7 +387,6 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self.on_finished)
         self.worker.error.connect(self.on_error)
 
-        # cleanup
         self.worker.finished.connect(self.thread.quit)
         self.worker.error.connect(self.thread.quit)
         self.thread.finished.connect(self.thread.deleteLater)
@@ -407,9 +394,6 @@ class MainWindow(QMainWindow):
         self.thread.start()
 
     def _person_conf_time_path(self, p):
-        """
-        Farklı PersonResult şemaları için robust okuma.
-        """
         label = _getattr(p, "final_label", "")
 
         if label == "baretli":
@@ -419,13 +403,12 @@ class MainWindow(QMainWindow):
         else:
             conf = _getattr(p, "best_baretsiz_conf", None)
             tsec = _getattr(p, "best_baretsiz_time_sec", None)
-            path = None
+            path = _getattr(p, "best_baretsiz_frame_path", None)
 
         if conf is None:
             conf = _getattr(p, "best_conf", None)
         if tsec is None:
             tsec = _getattr(p, "best_time_sec", None)
-
         if path is None:
             path = _getattr(p, "best_frame_path", "")
 
@@ -440,6 +423,9 @@ class MainWindow(QMainWindow):
         show_baretli = self.chk_show_baretli.isChecked()
 
         people = list(result.people)
+
+        # Güvenlik: Analyzer eski sürüm olsa bile UI’da 0.79 altı ASLA görünmesin
+        people = [p for p in people if self._person_conf_time_path(p)[0] >= REPORT_MIN_CONF]
 
         if not show_baretli:
             people = [p for p in people if _getattr(p, "final_label", "") == "baretsiz"]
@@ -457,11 +443,10 @@ class MainWindow(QMainWindow):
 
             conf, tsec, path = self._person_conf_time_path(p)
 
-            self.table.setItem(r, 2, QTableWidgetItem("" if conf <= 0 else f"{conf:.2f}"))
+            self.table.setItem(r, 2, QTableWidgetItem(f"{conf:.2f}"))
             self.table.setItem(r, 3, QTableWidgetItem("" if tsec == float("inf") else f"{tsec:.2f}"))
             self.table.setItem(r, 4, QTableWidgetItem(path))
 
-        # Otomatik seçim: önce baretsiz, yoksa ilk satır
         selected = False
         for r in range(self.table.rowCount()):
             it = self.table.item(r, 1)
@@ -474,7 +459,7 @@ class MainWindow(QMainWindow):
 
         if self.table.rowCount() == 0:
             self.preview.setPixmap(QPixmap())
-            self.preview.setText("Kayıt yok (filtre nedeniyle boş olabilir).")
+            self.preview.setText("Kayıt yok (0.79 eşiği nedeniyle boş olabilir).")
             self.btn_open_file.setEnabled(False)
         else:
             self.preview.setPixmap(QPixmap())
@@ -498,7 +483,7 @@ class MainWindow(QMainWindow):
 
         if getattr(result, "baretsiz_count", 0) == 0:
             self.preview.setPixmap(QPixmap())
-            self.preview.setText("Baretsiz alarm bulunamadı.")
+            self.preview.setText("Baretsiz kayıt bulunamadı (0.79 eşiği nedeniyle olabilir).")
 
     @Slot()
     def refresh_table_from_last(self):
@@ -541,7 +526,7 @@ class MainWindow(QMainWindow):
             self.btn_open_file.setEnabled(True)
         else:
             self.preview.setPixmap(QPixmap())
-            self.preview.setText("Bu kayıt için kare yok.")
+            self.preview.setText("Bu kayıt için kare yok (baretli kayıtlar dosya yazmadan raporlanıyor olabilir).")
             self.btn_open_file.setEnabled(False)
 
     @Slot()
