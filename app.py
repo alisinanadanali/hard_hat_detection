@@ -166,7 +166,7 @@ class AnalyzeWorker(QObject):
 
             detector = YoloTrackedHelmetDetector(
                 model_path=self.model_path,
-                imgsz=1024,
+                imgsz=960,
                 conf_thres=0.15,   # tracker adayı (düşük kalabilir)
                 iou_thres=0.45,
                 device=None,

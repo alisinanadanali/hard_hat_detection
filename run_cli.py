@@ -55,7 +55,7 @@ def main():
 
     detector = YoloTrackedHelmetDetector(
         model_path=str(model_path),
-        imgsz=1024,
+        imgsz=960,
         conf_thres=0.25,
         iou_thres=0.45,
         device=(args.device if args.device else None),
